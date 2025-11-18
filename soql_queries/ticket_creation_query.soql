@@ -1,0 +1,153 @@
+SELECT 
+            bac.Id,
+            bac.Account__c,
+            bac.Brand_Type__c,
+            bac.Name,
+            bac.New_Brand__c,
+            bac.Data_center__c,
+            bac.Account__r.Owner.EIN__c,
+            bac.Account__r.Owner_Email__c,
+            bac.Account__r.Client_Success_Manager_Email__c,
+            (
+                SELECT
+                    cb.Id,
+                    cb.Client__c,
+                    cb.Client__r.Name,
+                    cb.Client__r.Netsuite_External_Client_ID__c
+                FROM Client_Brand__r cb
+            ),
+            (
+                SELECT
+                    ba.Id,
+                    ba.Email__c,
+                    ba.Username__c,
+                    ba.First_Name__c,
+                    ba.Last_Name__c
+                FROM Brand_Admins__r ba
+                WHERE
+                    ba.Brand_Account__r.New_Brand__c = TRUE OR DAY_ONLY(ba.CreatedDate) > 2023-08-06
+            ),
+            (
+                SELECT
+                    pl.Id,
+                    pl.License_Name__c,
+                    pl.Internal_Bundle_Id__c,
+                    pl.isTrial__c,
+                    pl.Product_Code__c,
+                    pl.Product_Name__c,
+                    pl.Provisioning_Category__c,
+                    pl.Quantity_Allocated__c,
+                    pl.Start_Date__c,
+                    pl.Expiration_Date__c,
+                    pl.Disabled_Date__c,
+                    pl.Unlimited_Quantity__c,
+                    pl.LMS_Configuration__r.Effective_Date__c,
+                    pl.Subscription__r.SBQQ__StartDate__c,
+                    pl.Subscription__r.SBQQ__EndDate__c,
+                    // I think we need to pass the Scheduled_Deactivation_Date__c or else our engineering team cannot see it on the ticket
+                    Contract__r.Scheduled_Deactivation_Date__c 
+                FROM bac.Provisioning_Lines__r pl
+                
+                // Determines WHAT lines are passed on a ticket
+                WHERE
+                    (
+                        (pl.LMS_Config_Status__c = 'Activated' AND pl.Active__c = TRUE)
+                        // Look through the Contract Object for Scheduled Deactivation Date
+                        OR (Contract__r.Scheduled_Deactivation_Date__c != NULL AND Contract__r.Scheduled_Deactivation_Date__c >= TODAY)
+                    )
+                    AND (pl.Provisioning_Process__c = NULL OR pl.Provisioning_Process__c IN ('ORM'))
+                    AND pl.Start_Date__c <= TODAY
+                    AND pl.Quantity_Allocated__c > 0
+            )
+        FROM Brand_Account__c bac
+
+        // Determines WHEN a ticket is generated
+        WHERE
+            bac.Id in
+            (
+                SELECT Brand_Account__c
+                FROM Provisioning_Line__c
+                WHERE
+                    // Exclude ticket creations for the SFDC Test Account
+                    (
+                        Brand_Account__r.Account__c <> '00150000013Tzd0AAC'
+                        OR Brand_Account__r.Name LIKE 'provisioningtest%'
+                    )
+
+                    // Self_Service__c does not appear to be a field supported anymore? Will this break anything to stay?
+                    AND Quote_Line__r.SBQQ__Quote__r.Self_Service__c = FALSE
+
+                    AND
+                    (
+                        // Triggers ticket on end of license, either at Scheduled_Deactivation_Date__c or Expiration_Date__c, to deprovision if needed
+                        (
+                            (
+                                // Seems like we can combine conditions for simplicity into the following  
+                                Disabled_Date__c= NULL 
+                                AND (
+                                       // Trigger ticket the day after Scheduled_Deactivation_Date__c to deprovision the license as needed
+                                       Contract__r.Scheduled_Deactivation_Date__c = YESTERDAY
+                                          OR 
+                                       Expiration_Date__c = LAST_N_DAYS:3
+                                    )
+                            )
+                            OR 
+                            Disabled_Date__c = LAST_N_DAYS:3
+                        )
+                        // Conditions for Active Lines
+                        OR
+                        (
+                            
+                            (
+                                // Lines must be active
+                                LMS_Config_Status__c = 'Activated'
+                                AND Subscription__r.SBQQ__EndDate__c > TODAY
+                                AND Active__c = TRUE
+                                AND LMS_Configuration__r.Effective_Date__c <= TODAY
+                                AND Quantity_Allocated__c > 0
+                                AND
+                                (
+                                    // Triggers on the Start of a License
+                                    Start_Date__c = LAST_N_DAYS:3
+                                    OR
+                                    // Triggers for other active conditions
+                                    (
+                                        Start_Date__c <= TODAY
+                                        AND
+                                        (
+                                            CreatedDate = LAST_N_DAYS:3
+                                            OR
+                                            Subscription__r.SBQQ__StartDate__c = LAST_N_DAYS:3
+                                            OR
+                                            (
+                                                Subscription__r.CreatedDate = LAST_N_DAYS:3
+                                                AND Subscription__r.SBQQ__StartDate__c <= TODAY
+                                            )
+                                            OR
+                                            // Triggers if active line is modified
+                                            (
+                                                LastModifiedDate = LAST_N_DAYS:3
+                                                AND Subscription__r.SBQQ__StartDate__c <= TODAY
+                                                AND Subscription__r.SBQQ__EndDate__c > TODAY
+                                            )
+                                        )
+                                    )
+                                    // A catch for everything else?
+                                    OR (
+                                        Disabled_Date__c = NULL
+                                        AND Active__c = TRUE
+                                        AND Quantity_Allocated__c > 0
+                                    )
+                                )
+                                AND
+                                // Do not trigger for Straight Renewals as provisioning is assumed to already be complete/unchanged
+                                (
+                                    Quote_Line__r.SBQQ__Quote__r.Quote_Type__c <> 'Straight Renewal'
+                                    OR New_Brand__c = FALSE
+                                )
+                            )
+                            // Migrated Provisioning Lines will not trigger provisioning events. Likely implemented previously to allow bulk addition into the system without overloading the system.
+                            AND Migrated_Active__c = FALSE
+                        )
+                    )
+            )
